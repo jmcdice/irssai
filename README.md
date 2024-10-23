@@ -45,12 +45,12 @@ Run IRSSAI with different bot combinations:
 
 ```bash
 # Run with all available bots
-python main.py
+./irssai
 
 # Run with specific bots
-python main.py --gpt     # GPT bot only
-python main.py --ollama  # Ollama bot only
-python main.py --all     # All bots explicitly
+./irssai --gpt     # GPT bot only
+./irssai --ollama  # Ollama bot only
+./irssai --all     # All bots explicitly
 ```
 
 ### Commands
