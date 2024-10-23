@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+# main.py
+
+import asyncio
+import argparse
+import os
+import re
+import signal
+import sys
+from datetime import datetime
+from typing import List, Dict
+
+from prompt_toolkit import Application
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.filters import has_focus
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout, HSplit, Window, ScrollOffsets, ScrollbarMargin
+from prompt_toolkit.layout.containers import WindowAlign
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.styles import Style
+from prompt_toolkit.widgets import Frame
+
+# Import chatbots
+from chatbots import Chatbot
+from chatbots.gpt_bot import GPTBot
+from chatbots.ollama_bot import OllamaBot
+
+
+class ChatApplication:
+
+    def __init__(self):
+        self.chatbots: List[Chatbot] = []
+        self.message_content = []
+        self.shared_conversation_history: List[Dict[str, str]] = []
+        self.input_buffer = Buffer()
+        self.kb = KeyBindings()
+        self.app: Application = None
+        self.auto_scroll = True
+
+        # Define your styles (colors)
+        self.style = Style.from_dict({
+            'timestamp': '#888888',
+            'user': 'bold',
+            'bot_name': 'ansired bold',
+            'system': 'ansiyellow',
+            'message': '',
+        })
+
+        self.setup_layout()
+        self.setup_keybindings()
+
+    def setup_keybindings(self):
+        @self.kb.add('c-c')
+        def _(event):
+            """Exit the application on Ctrl+C."""
+            event.app.exit()
+
+        @self.kb.add('enter')
+        def _(event):
+            """Handle message submission."""
+            message = self.input_buffer.text
+            if message.strip():
+                asyncio.create_task(self.handle_message(message))
+                self.input_buffer.reset()
+
+        # Global scrolling key bindings
+        @self.kb.add('pageup')
+        def _(event):
+            window = self.message_window
+            info = window.render_info
+            if info:
+                window.vertical_scroll -= info.window_height
+                window.vertical_scroll = max(0, window.vertical_scroll)
+
+        @self.kb.add('pagedown')
+        def _(event):
+            window = self.message_window
+            info = window.render_info
+            if info:
+                window.vertical_scroll += info.window_height
+                max_scroll = max(0, info.content_height - info.window_height)
+                window.vertical_scroll = min(window.vertical_scroll, max_scroll)
+
+        @self.kb.add('up')
+        def _(event):
+            window = self.message_window
+            window.vertical_scroll = max(0, window.vertical_scroll - 1)
+
+        @self.kb.add('down')
+        def _(event):
+            window = self.message_window
+            info = window.render_info
+            if info:
+                max_scroll = max(0, info.content_height - info.window_height)
+                window.vertical_scroll = min(window.vertical_scroll + 1, max_scroll)
+
+        # Optional focus switching
+        @self.kb.add('c-w')
+        def _(event):
+            """Switch focus between input and message window."""
+            if self.layout.has_focus(self.input_window):
+                self.layout.focus(self.message_window)
+            else:
+                self.layout.focus(self.input_window)
+
+    def setup_layout(self):
+        # Message display area with improved scrolling and colors
+        self.message_window = Window(
+            content=FormattedTextControl(
+                text=lambda: self.message_content,
+                focusable=True,
+                show_cursor=False,
+            ),
+            wrap_lines=True,
+            allow_scroll_beyond_bottom=True,
+            scroll_offsets=ScrollOffsets(top=2, bottom=2),
+            right_margins=[ScrollbarMargin(display_arrows=True)],
+            height=None,  # Let it expand
+        )
+
+        # Input area
+        self.input_window = Window(
+            content=BufferControl(
+                buffer=self.input_buffer,
+                focusable=True,
+            ),
+            height=1,
+            wrap_lines=False,
+            align=WindowAlign.LEFT,
+        )
+
+        # Create the main container
+        main_container = HSplit([
+            self.message_window,
+            Window(height=1, char='-'),
+            self.input_window,
+        ])
+
+        # Main layout with frame
+        root_container = Frame(
+            main_container,
+            title="IRSSAI"
+        )
+
+        # Create the layout
+        self.layout = Layout(root_container)
+
+        # Set initial focus to input window
+        self.layout.focus(self.input_window)
+
+    async def insert_formatted_text(self, formatted_text):
+        """Insert formatted text into the message content."""
+        self.message_content.extend(formatted_text)
+        self.auto_scroll = True  # Set flag to auto-scroll
+        if self.app:
+            self.app.invalidate()
+
+    def format_user_message(self, message):
+        timestamp = datetime.now().strftime("%H:%M")
+        return [
+            ('class:timestamp', timestamp + ' '),
+            ('class:user', 'Me: '),
+            ('class:message', message),
+            ('', '\n')
+        ]
+
+    def format_bot_message(self, bot_name, message):
+        timestamp = datetime.now().strftime("%H:%M")
+        return [
+            ('class:timestamp', timestamp + ' '),
+            ('class:bot_name', bot_name + ': '),
+            ('class:message', message),
+            ('', '\n')
+        ]
+
+    def format_system_message(self, message):
+        timestamp = datetime.now().strftime("%H:%M")
+        return [
+            ('class:timestamp', timestamp + ' '),
+            ('class:system', '[System]: '),
+            ('class:message', message),
+            ('', '\n')
+        ]
+
+    async def handle_message(self, message: str):
+        """Handle new message from user, including direct addressing."""
+        if message.startswith('/'):
+            await self.handle_command(message)
+            return
+
+        # Format and display user's message
+        formatted_message = self.format_user_message(message)
+        await self.insert_formatted_text(formatted_message)
+
+        # Add to shared conversation history
+        self.shared_conversation_history.append({
+            "role": "user",
+            "content": message
+        })
+
+        # Check for direct addressing using @BotName
+        direct_match = re.match(r'^@(\w+)\s+(.+)$', message)
+        if direct_match:
+            bot_name = direct_match.group(1)
+            bot_message = direct_match.group(2)
+            # Find the bot by name
+            bot = next((b for b in self.chatbots if b.name.lower() == bot_name.lower()), None)
+            if bot:
+                await self.process_bot_response(bot, bot_message)
+            else:
+                await self.display_system_message(f"No bot found with name '{bot_name}'. Use /list to see available bots.")
+        else:
+            # If no direct addressing, all bots respond
+            for bot in self.chatbots:
+                await self.process_bot_response(bot, message)
+
+    async def process_bot_response(self, bot: Chatbot, message: str):
+        """Process response from a single bot, using shared conversation history."""
+        # Update bot's conversation history with shared history
+        bot.conversation_history = ([bot.personality] +
+                                    self.shared_conversation_history[-10:])  # Keep last 10 messages
+
+        response = await bot.process_message(message)
+        if response:
+            formatted_response = self.format_bot_message(bot.name, response)
+            await self.insert_formatted_text(formatted_response)
+
+            # Add bot's response to shared conversation history
+            self.shared_conversation_history.append({
+                "role": "assistant",
+                "content": f"{bot.name}: {response}"
+            })
+
+    async def exit_chat(self):
+        """Exit the chat application gracefully."""
+        await self.display_system_message("Exiting chat. Goodbye! 👋")
+        # Allow the message to display before exiting
+        await asyncio.sleep(1)  # Wait 1 second
+        self.app.exit()
+
+    async def handle_command(self, command: str):
+        """Parse and execute commands starting with '/'."""
+        parts = command.strip().split(' ', 1)
+        cmd = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ''
+
+        if cmd == '/clear':
+            await self.clear_chat()
+        elif cmd == '/reset':
+            await self.reset_chat()
+        elif cmd == '/exit':
+            await self.exit_chat()
+        elif cmd == '/help':
+            await self.display_help()
+        elif cmd == '/list':
+            await self.list_bots()
+        else:
+            await self.display_system_message(f"Unknown command: {cmd}")
+
+    async def list_bots(self):
+        """Display available bots and their models."""
+        bot_list = "\nAvailable bots:\n" + "\n".join(
+            f"- @{bot.name}" for bot in self.chatbots
+        )
+        await self.display_system_message(bot_list)
+
+    async def clear_chat(self):
+        """Clear the visible chat display."""
+        self.message_content = []
+        await self.display_system_message("Chat display cleared.")
+
+    async def reset_chat(self):
+        """Reset the chat history and internal chatbot states."""
+        self.message_content = []
+        self.shared_conversation_history = []
+        for bot in self.chatbots:
+            if hasattr(bot, 'reset_conversation') and asyncio.iscoroutinefunction(bot.reset_conversation):
+                await bot.reset_conversation()
+        await self.display_system_message("Chat history and chatbot states have been reset.")
+
+    async def display_help(self):
+        """Display available commands."""
+        help_message = (
+            "Available commands:\n"
+            "/clear - Clear the visible chat display.\n"
+            "/reset - Clear the chat history and reset chatbot states.\n"
+            "/exit - Exit the chat application.\n"
+            "/list - List available bots.\n"
+            "/help - Show this help message.\n\n"
+            "Direct messaging:\n"
+            "@BotName your message - Send a message to a specific bot"
+        )
+        await self.display_system_message(help_message)
+
+    async def display_system_message(self, message: str):
+        """Display a system message in the chat history."""
+        formatted_message = self.format_system_message(message)
+        await self.insert_formatted_text(formatted_message)
+
+    async def shutdown(self):
+        """Shutdown all chatbots gracefully."""
+        for bot in self.chatbots:
+            if hasattr(bot, 'close') and asyncio.iscoroutinefunction(bot.close):
+                await bot.close()
+
+    async def run_async(self):
+        """Run the application asynchronously."""
+        self.app = Application(
+            layout=self.layout,
+            key_bindings=self.kb,
+            full_screen=True,
+            mouse_support=True,
+            style=self.style,  # Use self.style here
+            after_render=self.after_render
+        )
+
+        # Register shutdown handler
+        loop = asyncio.get_running_loop()
+        for signame in ('SIGINT', 'SIGTERM'):
+            try:
+                loop.add_signal_handler(getattr(signal, signame), self.app.exit)
+            except NotImplementedError:
+                pass
+
+        try:
+            # Initialize with welcome message
+            await self.insert_formatted_text(self.format_system_message("Welcome to IRSSAI Chat!\nType /help for available commands.\n"))
+            await self.app.run_async()
+        finally:
+            await self.shutdown()
+
+    def after_render(self, app):
+        if self.auto_scroll:
+            window = self.message_window
+            info = window.render_info
+            if info:
+                max_scroll = max(0, info.content_height - info.window_height)
+                window.vertical_scroll = max_scroll
+                self.auto_scroll = False  # Reset the flag
+
+
+async def main_async(selected_bots: List[str]):
+    # Create chat application
+    chat_app = ChatApplication()
+
+    # Load bot prompts from files
+    def load_bot_prompt(filename: str) -> dict:
+        prompt_path = os.path.join('bot_prompts', filename)
+        try:
+            with open(prompt_path, 'r') as f:
+                content = f.read().strip()
+                return {
+                    "role": "system",
+                    "content": content
+                }
+        except FileNotFoundError:
+            print(f"Warning: Could not find prompt file {prompt_path}")
+            return None
+
+    # Load prompts for each bot
+    gpt_prompt = load_bot_prompt('gpt_bot.txt')
+    ollama_prompt = load_bot_prompt('ollama_bot.txt')
+
+    # Determine which bots to load based on selected_bots
+    available_bots = {
+        'gpt': GPTBot(personality=gpt_prompt),
+        'ollama': OllamaBot(personality=ollama_prompt, model="llama3.2")
+    }
+
+    if not selected_bots:
+        # If no bots specified, load all
+        chat_app.chatbots.extend(available_bots.values())
+    else:
+        for bot_name in selected_bots:
+            bot = available_bots.get(bot_name.lower())
+            if bot:
+                chat_app.chatbots.append(bot)
+            else:
+                print(f"Warning: Unknown bot '{bot_name}' specified and will be skipped.", file=sys.stderr)
+
+    if not chat_app.chatbots:
+        print("Error: No valid bots selected to run. Exiting.", file=sys.stderr)
+        sys.exit(1)
+
+    # Run the application asynchronously
+    await chat_app.run_async()
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="IRSSAI Chat Application with Selectable Bots."
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        '--gpt',
+        action='store_true',
+        help='Enable GPTBot only.'
+    )
+    group.add_argument(
+        '--ollama',
+        action='store_true',
+        help='Enable OllamaBot only.'
+    )
+    group.add_argument(
+        '--all',
+        action='store_true',
+        help='Enable both GPTBot and OllamaBot. (Default behavior)'
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_arguments()
+    selected_bots = []
+    if args.gpt:
+        selected_bots.append('gpt')
+    elif args.ollama:
+        selected_bots.append('ollama')
+    elif args.all:
+        selected_bots.extend(['gpt', 'ollama'])
+    else:
+        # Default to all if no arguments provided
+        selected_bots = []
+
+    try:
+        asyncio.run(main_async(selected_bots))
+    except KeyboardInterrupt:
+        sys.exit()

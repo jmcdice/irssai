@@ -1,0 +1,6 @@
+prompt_toolkit
+openai
+aiohttp
+beautifulsoup4
+prompt_toolkit
+asyncio
